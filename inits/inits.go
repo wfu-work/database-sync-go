@@ -49,6 +49,7 @@ func registerTables() {
 		domains.SyncTask{},
 		domains.SyncRun{},
 		domains.SyncError{},
+		domains.DatabaseBackup{},
 	)
 	if err != nil {
 		global.NAV_LOG.Error("register datasync business table failed", zap.Error(err))

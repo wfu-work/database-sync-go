@@ -8,6 +8,7 @@ type ApiGroup struct {
 	DataSourceApi
 	SyncTaskApi
 	SyncRunApi
+	DatabaseBackupApi
 }
 
 var (
@@ -15,4 +16,5 @@ var (
 	syncTaskService   = services.ServiceGroupApp.SyncTaskService
 	syncRunService    = services.ServiceGroupApp.SyncRunService
 	syncErrorService  = services.ServiceGroupApp.SyncErrorService
+	backupService     = services.ServiceGroupApp.DatabaseBackupService
 )

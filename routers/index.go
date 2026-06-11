@@ -11,16 +11,19 @@ var RouterGroupApp = new(RouterGroup)
 type RouterGroup struct {
 	DataSourceRouter
 	SyncRouter
+	DatabaseBackupRouter
 }
 
 var (
 	dataSourceApi = apis.ApiGroupApp.DataSourceApi
 	syncTaskApi   = apis.ApiGroupApp.SyncTaskApi
 	syncRunApi    = apis.ApiGroupApp.SyncRunApi
+	backupApi     = apis.ApiGroupApp.DatabaseBackupApi
 )
 
 func (r *RouterGroup) InitRouters(publicGroup *gin.RouterGroup, privateGroup *gin.RouterGroup) {
 	r.InitDataSourceRouter(publicGroup)
 	r.InitSyncRouter(publicGroup)
+	r.InitDatabaseBackupRouter(publicGroup)
 	_ = privateGroup
 }
