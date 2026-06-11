@@ -1,0 +1,30 @@
+system:
+  app-name: "datasync"
+  addr: 3010
+  db-type: sqlite
+  router-prefix: /api
+jwt:
+  issuer: datasync
+  signing-key: "datasync"
+  expires-time: 24h
+  buffer-time: 1h
+security:
+  secret-key: "datasync-secret"
+local:
+  oss-path: ./data/oss
+  proxy-oss-path: /oss
+  cache-path: ./data/cache.json
+sqlite:
+  db-name: datasync
+  path: ./data/
+zap:
+  director: logback
+  level: info
+  prefix: '[datasync-server]'
+  retention-day: 3
+sync:
+  default-batch-size: 1000
+  max-workers: 4
+  run-timeout: 2h
+  error-sample-limit: 1000
+  history-retention-days: 90
