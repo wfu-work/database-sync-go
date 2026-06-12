@@ -95,7 +95,12 @@ func (m *Manager) RunTask(task domains.SyncTask) (*domains.SyncRun, error) {
 		StartTime:   now,
 		CursorStart: task.CursorValue,
 	}
-	if err := db.Create(&run).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&run).Error; err != nil {
+			return err
+		}
+		return m.markTaskRunStarted(tx, task.Guid, run.Guid, now)
+	}); err != nil {
 		m.mu.Unlock()
 		return nil, err
 	}
@@ -162,7 +167,12 @@ func (m *Manager) RetryRunErrors(sourceRunGuid string) (*domains.SyncRun, error)
 		StartTime:   now,
 		CursorStart: task.CursorValue,
 	}
-	if err := db.Create(&run).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&run).Error; err != nil {
+			return err
+		}
+		return m.markTaskRunStarted(tx, task.Guid, run.Guid, now)
+	}); err != nil {
 		m.mu.Unlock()
 		return nil, err
 	}
@@ -348,6 +358,14 @@ func (m *Manager) removeRunning(taskGuid string) {
 	m.mu.Lock()
 	delete(m.running, taskGuid)
 	m.mu.Unlock()
+}
+
+func (m *Manager) markTaskRunStarted(db *gorm.DB, taskGuid string, runGuid string, now int64) error {
+	return db.Model(&domains.SyncTask{}).Where("guid = ?", taskGuid).Updates(map[string]any{
+		"last_run_guid":   runGuid,
+		"last_run_status": domains.RunStatusRunning,
+		"update_time":     now,
+	}).Error
 }
 
 func (m *Manager) maxWorkers() int {

@@ -170,6 +170,7 @@ func (s DataSourceService) Save(req SaveDataSourceRequest) (*PublicDataSource, e
 	if err := s.DB().Save(&row).Error; err != nil {
 		return nil, err
 	}
+	ServiceGroupApp.WebSocketService.Broadcast(WebSocketEventDataSourceUpdated, publicDataSource(row))
 	return publicDataSource(row), nil
 }
 
@@ -221,12 +222,23 @@ func (s DataSourceService) MigratePlaintextPasswords() error {
 	return nil
 }
 
-func (s DataSourceService) TestConnection(guid string) error {
+func (s DataSourceService) TestConnection(guid string) (*PublicDataSource, error) {
 	source, err := s.GetEnabled(guid)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return checkDataSourceConnection(*source)
+	err = checkDataSourceConnection(*source)
+	var row domains.DataSource
+	if fetchErr := s.DB().Where("guid = ?", source.Guid).First(&row).Error; fetchErr != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fetchErr
+	}
+	if err != nil {
+		return publicDataSource(row), err
+	}
+	return publicDataSource(row), nil
 }
 
 func (s DataSourceService) Tables(guid string) ([]connector.TableInfo, error) {
@@ -242,6 +254,24 @@ func (s DataSourceService) Tables(guid string) ([]connector.TableInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return conn.ListTables(ctx)
+}
+
+func (s DataSourceService) DatabaseDetail(guid string) (*connector.DatabaseDetail, error) {
+	source, err := s.GetEnabled(guid)
+	if err != nil {
+		return nil, err
+	}
+	if source.ConnectionStatus != domains.DataSourceConnectionConnected {
+		return nil, errors.New("datasource connection is not healthy")
+	}
+	conn, err := connector.New(*source)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return conn.DatabaseDetail(ctx)
 }
 
 func (s DataSourceService) Columns(guid string, table string) ([]connector.ColumnInfo, error) {
@@ -359,4 +389,12 @@ func publicDataSource(item domains.DataSource) *PublicDataSource {
 		CreateTime:          item.CreateTime,
 		UpdateTime:          item.UpdateTime,
 	}
+}
+
+func broadcastDataSourceByGuid(guid string) {
+	var row domains.DataSource
+	if err := ServiceGroupApp.DataSourceService.DB().Where("guid = ?", guid).First(&row).Error; err != nil {
+		return
+	}
+	ServiceGroupApp.WebSocketService.Broadcast(WebSocketEventDataSourceUpdated, publicDataSource(row))
 }

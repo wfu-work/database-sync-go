@@ -47,9 +47,11 @@ func registerTables() {
 	err := global.NAV_DB.AutoMigrate(
 		domains.DataSource{},
 		domains.SyncTask{},
+		domains.SyncTemplate{},
 		domains.SyncRun{},
 		domains.SyncError{},
 		domains.DatabaseBackup{},
+		domains.DatabaseRestore{},
 		domains.EventNotification{},
 		domains.SystemSetting{},
 	)
@@ -69,6 +71,9 @@ func startBackgroundServices() {
 	}
 	if err := services.ServiceGroupApp.DatabaseBackupService.RecoverStaleBackups(); err != nil {
 		global.NAV_LOG.Warn("recover datasync stale backups failed", zap.Error(err))
+	}
+	if err := services.ServiceGroupApp.DatabaseRestoreService.RecoverStaleRestores(); err != nil {
+		global.NAV_LOG.Warn("recover datasync stale restores failed", zap.Error(err))
 	}
 	if err := manager.DefaultManager.StartScheduler(); err != nil {
 		global.NAV_LOG.Warn("start datasync scheduler failed", zap.Error(err))

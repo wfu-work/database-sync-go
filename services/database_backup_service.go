@@ -166,6 +166,7 @@ func (s DatabaseBackupService) Start(req StartDatabaseBackupRequest) (*domains.D
 	if err := s.DB().Create(&row).Error; err != nil {
 		return nil, err
 	}
+	s.broadcastBackupByGuid(row.Guid)
 
 	go s.runBackup(row.Guid, *source, req.Tables, backupRunOptions{
 		BatchSize:        req.BatchSize,
@@ -205,7 +206,7 @@ func (s DatabaseBackupService) Retry(guid string) (*domains.DatabaseBackup, erro
 	if retryIntervalMs <= 0 {
 		retryIntervalMs = defaultBackupRetryIntervalMs()
 	}
-	if err := s.DB().Model(&domains.DatabaseBackup{}).Where("guid = ?", row.Guid).Updates(map[string]any{
+	if err := s.updateBackup(row.Guid, map[string]any{
 		"data_source_name":  source.Name,
 		"data_source_type":  source.Type,
 		"database":          source.Database,
@@ -231,7 +232,7 @@ func (s DatabaseBackupService) Retry(guid string) (*domains.DatabaseBackup, erro
 		"duration_ms":       0,
 		"last_error":        "",
 		"update_time":       now,
-	}).Error; err != nil {
+	}); err != nil {
 		return nil, err
 	}
 	go s.runBackup(row.Guid, *source, tables, backupRunOptions{
@@ -282,7 +283,7 @@ func (s DatabaseBackupService) RecoverStaleBackups() error {
 		return errors.New("database not initialized")
 	}
 	now := domains.NowMilli()
-	return db.Model(&domains.DatabaseBackup{}).
+	err := db.Model(&domains.DatabaseBackup{}).
 		Where("status IN ?", []string{domains.BackupStatusPending, domains.BackupStatusRunning}).
 		Updates(map[string]any{
 			"status":      domains.BackupStatusFailed,
@@ -291,6 +292,16 @@ func (s DatabaseBackupService) RecoverStaleBackups() error {
 			"last_error":  "服务重启或备份进程中断，备份未完成",
 			"update_time": now,
 		}).Error
+	if err != nil {
+		return err
+	}
+	var rows []domains.DatabaseBackup
+	if findErr := db.Where("end_time = ? AND last_error = ?", now, "服务重启或备份进程中断，备份未完成").Find(&rows).Error; findErr == nil {
+		for _, row := range rows {
+			ServiceGroupApp.WebSocketService.Broadcast(WebSocketEventBackupUpdated, row)
+		}
+	}
+	return nil
 }
 
 func (s DatabaseBackupService) runBackup(backupGuid string, source domains.DataSource, tables []string, opts backupRunOptions) {
@@ -299,9 +310,8 @@ func (s DatabaseBackupService) runBackup(backupGuid string, source domains.DataS
 	opts = normalizeBackupRunOptions(opts)
 	source.Params = mergeBackupParams(source.Params, opts.ConnectionParams)
 
-	db := s.DB()
 	start := domains.NowMilli()
-	_ = db.Model(&domains.DatabaseBackup{}).Where("guid = ?", backupGuid).Updates(map[string]any{
+	_ = s.updateBackup(backupGuid, map[string]any{
 		"status":          domains.BackupStatusRunning,
 		"start_time":      start,
 		"finished_tables": 0,
@@ -311,7 +321,7 @@ func (s DatabaseBackupService) runBackup(backupGuid string, source domains.DataS
 		"current_batch":   0,
 		"current_started": 0,
 		"update_time":     start,
-	}).Error
+	})
 
 	filePath, fileName, totalTables, totalRows, err := s.writeBackup(ctx, backupGuid, source, tables, opts)
 	if err != nil {
@@ -349,7 +359,7 @@ func (s DatabaseBackupService) writeBackup(ctx context.Context, backupGuid strin
 		return "", "", 0, 0, errors.New("no tables to backup")
 	}
 	tablesJSON, _ := json.Marshal(tables)
-	_ = s.DB().Model(&domains.DatabaseBackup{}).Where("guid = ?", backupGuid).Updates(map[string]any{
+	_ = s.updateBackup(backupGuid, map[string]any{
 		"tables":          string(tablesJSON),
 		"total_tables":    len(tables),
 		"finished_tables": 0,
@@ -359,7 +369,7 @@ func (s DatabaseBackupService) writeBackup(ctx context.Context, backupGuid strin
 		"current_batch":   0,
 		"current_started": 0,
 		"update_time":     domains.NowMilli(),
-	}).Error
+	})
 
 	dir := backupDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -398,14 +408,14 @@ func (s DatabaseBackupService) writeBackup(ctx context.Context, backupGuid strin
 			return filePath, fileName, len(tables), totalRows, ctx.Err()
 		default:
 		}
-		_ = s.DB().Model(&domains.DatabaseBackup{}).Where("guid = ?", backupGuid).Updates(map[string]any{
+		_ = s.updateBackup(backupGuid, map[string]any{
 			"current_table":   table,
 			"current_rows":    0,
 			"current_total":   0,
 			"current_batch":   0,
 			"current_started": domains.NowMilli(),
 			"update_time":     domains.NowMilli(),
-		}).Error
+		})
 		tableMeta, err := s.writeTableBackup(ctx, backupGuid, zipWriter, conn, table, i, opts)
 		if err != nil {
 			_ = zipWriter.Close()
@@ -413,13 +423,13 @@ func (s DatabaseBackupService) writeBackup(ctx context.Context, backupGuid strin
 		}
 		manifest.Tables = append(manifest.Tables, tableMeta)
 		totalRows += tableMeta.RowCount
-		_ = s.DB().Model(&domains.DatabaseBackup{}).Where("guid = ?", backupGuid).Updates(map[string]any{
+		_ = s.updateBackup(backupGuid, map[string]any{
 			"finished_tables": i + 1,
 			"total_rows":      totalRows,
 			"current_rows":    tableMeta.RowCount,
 			"current_total":   tableMeta.RowCount,
 			"update_time":     domains.NowMilli(),
-		}).Error
+		})
 	}
 	manifest.TotalRows = totalRows
 	if err := writeZipJSON(zipWriter, "manifest.json", manifest); err != nil {
@@ -459,10 +469,10 @@ func (s DatabaseBackupService) writeTableBackup(ctx context.Context, backupGuid 
 	encoder := json.NewEncoder(dataWriter)
 	estimatedRows, countErr := conn.Count(ctx, connector.QueryOptions{Table: table})
 	if countErr == nil {
-		_ = s.DB().Model(&domains.DatabaseBackup{}).Where("guid = ?", backupGuid).Updates(map[string]any{
+		_ = s.updateBackup(backupGuid, map[string]any{
 			"current_total": estimatedRows,
 			"update_time":   domains.NowMilli(),
-		}).Error
+		})
 	}
 	var rowCount int64
 	offset := 0
@@ -489,12 +499,12 @@ func (s DatabaseBackupService) writeTableBackup(ctx context.Context, backupGuid 
 		rowCount += int64(len(rows))
 		batchIndex += 1
 		if len(rows) > 0 || batchIndex == 1 {
-			_ = s.DB().Model(&domains.DatabaseBackup{}).Where("guid = ?", backupGuid).Updates(map[string]any{
+			_ = s.updateBackup(backupGuid, map[string]any{
 				"current_rows":  rowCount,
 				"current_total": estimatedRows,
 				"current_batch": batchIndex,
 				"update_time":   domains.NowMilli(),
-			}).Error
+			})
 		}
 		if len(rows) < opts.BatchSize {
 			break
@@ -542,11 +552,27 @@ func (s DatabaseBackupService) finishBackup(backupGuid string, status string, fi
 	if err != nil {
 		updates["last_error"] = err.Error()
 	}
-	_ = s.DB().Model(&domains.DatabaseBackup{}).Where("guid = ?", backupGuid).Updates(updates).Error
+	_ = s.updateBackup(backupGuid, updates)
 	var backup domains.DatabaseBackup
 	if findErr := s.DB().Where("guid = ?", backupGuid).First(&backup).Error; findErr == nil {
 		ServiceGroupApp.EventNotificationService.NotifyBackupFinished(backup, err)
 	}
+}
+
+func (s DatabaseBackupService) updateBackup(backupGuid string, updates map[string]any) error {
+	if err := s.DB().Model(&domains.DatabaseBackup{}).Where("guid = ?", backupGuid).Updates(updates).Error; err != nil {
+		return err
+	}
+	s.broadcastBackupByGuid(backupGuid)
+	return nil
+}
+
+func (s DatabaseBackupService) broadcastBackupByGuid(backupGuid string) {
+	var backup domains.DatabaseBackup
+	if err := s.DB().Where("guid = ?", backupGuid).First(&backup).Error; err != nil {
+		return
+	}
+	ServiceGroupApp.WebSocketService.Broadcast(WebSocketEventBackupUpdated, backup)
 }
 
 func removePartialBackupFile(filePath string) {
@@ -715,6 +741,10 @@ func backupDir() string {
 }
 
 func defaultBackupBatchSize() int {
+	setting, err := ServiceGroupApp.SystemSettingService.GetSyncSetting()
+	if err == nil && setting.BackupBatchSize > 0 {
+		return setting.BackupBatchSize
+	}
 	if global.NAV_VIPER != nil {
 		if value := global.NAV_VIPER.GetInt("backup.default-batch-size"); value > 0 {
 			return value
@@ -727,6 +757,10 @@ func defaultBackupBatchSize() int {
 }
 
 func defaultBackupRetryIntervalMs() int {
+	setting, err := ServiceGroupApp.SystemSettingService.GetSyncSetting()
+	if err == nil && setting.BackupRetryIntervalMs > 0 {
+		return setting.BackupRetryIntervalMs
+	}
 	if global.NAV_VIPER != nil {
 		if value := global.NAV_VIPER.GetInt("backup.retry-interval-ms"); value > 0 {
 			return value
@@ -736,6 +770,10 @@ func defaultBackupRetryIntervalMs() int {
 }
 
 func backupTimeout() time.Duration {
+	setting, err := ServiceGroupApp.SystemSettingService.GetSyncSetting()
+	if err == nil && setting.BackupTimeoutSeconds > 0 {
+		return time.Duration(setting.BackupTimeoutSeconds) * time.Second
+	}
 	if global.NAV_VIPER != nil {
 		if value := global.NAV_VIPER.GetDuration("backup.timeout"); value > 0 {
 			return value

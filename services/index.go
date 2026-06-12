@@ -13,11 +13,15 @@ var ServiceGroupApp = new(ServiceGroup)
 type ServiceGroup struct {
 	DataSourceService
 	SyncTaskService
+	SyncTemplateService
 	SyncRunService
 	SyncErrorService
 	DatabaseBackupService
+	DatabaseRestoreService
 	EventNotificationService
 	SystemSettingService
+	SystemMonitorService
+	WebSocketService
 }
 
 func PageResult(items any, total int64, params map[string]string) commonDomains.PageResult {

@@ -35,6 +35,25 @@ func (a SyncTaskApi) List(c *gin.Context) {
 	response.Ok(services.PageResult(items, total, params), c)
 }
 
+// Get 获取同步任务详情
+// @Summary 获取同步任务详情
+// @Description 根据 GUID 获取同步任务详情
+// @Tags 数据同步-任务
+// @Security ApiKeyAuth
+// @Accept json
+// @Produce json
+// @Param guid path string true "同步任务 GUID"
+// @Success 200 {object} response.Response{data=domains.SyncTask,msg=string} "获取同步任务详情成功"
+// @Router /sync/tasks/{guid} [get]
+func (a SyncTaskApi) Get(c *gin.Context) {
+	item, err := syncTaskService.Get(c.Param("guid"))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(item, c)
+}
+
 // Save 保存同步任务
 // @Summary 保存同步任务
 // @Description 创建或更新同步任务，支持字段映射、默认值、转换函数、全量同步和增量同步配置

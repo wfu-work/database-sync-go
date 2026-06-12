@@ -31,15 +31,15 @@ var fileContentTypeMap = map[string]string{
 
 func InitStatic(engine *gin.Engine) error {
 	return StaticFile(Static(), func(fileMap map[string][]byte) {
-		indexHTML, ok := fileMap["navmesh-web/browser/index.html"]
+		indexHTML, ok := fileMap["database-sync-web/browser/index.html"]
 		if !ok {
-			panic("navmesh-web/browser/index.html 文件不存在")
+			panic("database-sync-web/browser/index.html 文件不存在")
 		}
 
 		for fileKey, fileBytes := range fileMap {
 			fileKey := fileKey
 			fileBytes := fileBytes
-			ginStaticFilePath := strings.TrimPrefix(fileKey, "navmesh-web/browser/")
+			ginStaticFilePath := strings.TrimPrefix(fileKey, "database-sync-web/browser/")
 			if ginStaticFilePath == "" {
 				continue
 			}

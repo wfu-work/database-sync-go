@@ -73,6 +73,7 @@ func checkDataSourceConnection(source domains.DataSource) error {
 		"connection_checked_at": now,
 		"update_time":           now,
 	}).Error
+	broadcastDataSourceByGuid(source.Guid)
 
 	err := testDataSourceConnection(source)
 	status := domains.DataSourceConnectionConnected
@@ -89,6 +90,8 @@ func checkDataSourceConnection(source domains.DataSource) error {
 		"update_time":           checkedAt,
 	}).Error; updateErr != nil {
 		global.NAV_LOG.Warn("update datasource connection status failed", zap.String("datasource", source.Guid), zap.Error(updateErr))
+	} else {
+		broadcastDataSourceByGuid(source.Guid)
 	}
 
 	source.ConnectionStatus = status

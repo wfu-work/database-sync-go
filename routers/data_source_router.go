@@ -14,6 +14,7 @@ func (r *DataSourceRouter) InitDataSourceRouter(router *gin.RouterGroup) {
 		group.DELETE(":guid", dataSourceApi.Delete)
 		group.POST(":guid/test", dataSourceApi.Test)
 		group.GET(":guid/tables", dataSourceApi.Tables)
+		group.GET(":guid/database-detail", dataSourceApi.DatabaseDetail)
 		group.GET(":guid/columns", dataSourceApi.Columns)
 		group.POST(":guid/preview", dataSourceApi.Preview)
 	}

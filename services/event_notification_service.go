@@ -98,7 +98,11 @@ func (s EventNotificationService) CreateEvent(req CreateEventNotificationRequest
 	}
 	row.CreateTime = now
 	row.UpdateTime = now
-	return s.DB().Create(&row).Error
+	if err := s.DB().Create(&row).Error; err != nil {
+		return err
+	}
+	ServiceGroupApp.WebSocketService.Broadcast(WebSocketEventNotificationCreated, row)
+	return nil
 }
 
 func (s EventNotificationService) MarkRead(guid string) error {

@@ -15,6 +15,13 @@ type FieldMapping struct {
 	Transform string `json:"transform,omitempty"`
 }
 
+type TagMapping struct {
+	Name      string `json:"name"`
+	Source    string `json:"source,omitempty"`
+	Default   any    `json:"default,omitempty"`
+	Transform string `json:"transform,omitempty"`
+}
+
 type Row map[string]any
 
 func Validate(fields []FieldMapping) error {
@@ -27,6 +34,18 @@ func Validate(fields []FieldMapping) error {
 		}
 		if strings.TrimSpace(field.Source) == "" && field.Default == nil {
 			return fmt.Errorf("field mapping[%d].source or default required", i)
+		}
+	}
+	return nil
+}
+
+func ValidateTags(tags []TagMapping) error {
+	for i, tag := range tags {
+		if strings.TrimSpace(tag.Name) == "" {
+			return fmt.Errorf("tag mapping[%d].name required", i)
+		}
+		if strings.TrimSpace(tag.Source) == "" && tag.Default == nil {
+			return fmt.Errorf("tag mapping[%d].source or default required", i)
 		}
 	}
 	return nil
@@ -50,6 +69,22 @@ func MapRows(rows []Row, fields []FieldMapping) ([]Row, error) {
 		out = append(out, mapped)
 	}
 	return out, nil
+}
+
+func MapTagValues(row Row, tags []TagMapping) (Row, error) {
+	mapped := Row{}
+	for _, tag := range tags {
+		value, ok := lookup(row, tag.Source)
+		if !ok {
+			value = tag.Default
+		}
+		transformed, err := Transform(value, tag.Transform)
+		if err != nil {
+			return nil, fmt.Errorf("map %s to tag %s failed: %w", tag.Source, tag.Name, err)
+		}
+		mapped[strings.TrimSpace(tag.Name)] = transformed
+	}
+	return mapped, nil
 }
 
 func Lookup(row Row, key string) (any, bool) {

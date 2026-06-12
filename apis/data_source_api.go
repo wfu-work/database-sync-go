@@ -86,14 +86,15 @@ func (a DataSourceApi) Delete(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param guid path string true "数据源 GUID"
-// @Success 200 {object} response.Response{data=bool,msg=string} "测试连接成功"
+// @Success 200 {object} response.Response{data=services.PublicDataSource,msg=string} "测试连接成功，返回更新后的连接状态"
 // @Router /datasources/{guid}/test [post]
 func (a DataSourceApi) Test(c *gin.Context) {
-	if err := dataSourceService.TestConnection(c.Param("guid")); err != nil {
+	item, err := dataSourceService.TestConnection(c.Param("guid"))
+	if err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
-	response.Ok(true, c)
+	response.Ok(item, c)
 }
 
 // Tables 获取数据源表列表
@@ -113,6 +114,25 @@ func (a DataSourceApi) Tables(c *gin.Context) {
 		return
 	}
 	response.Ok(items, c)
+}
+
+// DatabaseDetail 获取数据库详情
+// @Summary 获取数据库详情
+// @Description 获取健康数据源的数据库基础信息、连接信息、存储信息、表统计和性能指标
+// @Tags 数据同步-数据源
+// @Security ApiKeyAuth
+// @Accept json
+// @Produce json
+// @Param guid path string true "数据源 GUID"
+// @Success 200 {object} response.Response{data=connector.DatabaseDetail,msg=string} "获取数据库详情成功"
+// @Router /datasources/{guid}/database-detail [get]
+func (a DataSourceApi) DatabaseDetail(c *gin.Context) {
+	detail, err := dataSourceService.DatabaseDetail(c.Param("guid"))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(detail, c)
 }
 
 // Columns 获取数据源表字段

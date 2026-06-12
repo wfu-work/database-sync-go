@@ -33,6 +33,9 @@ func TestSystemSettingServiceGetDefaultSyncSetting(t *testing.T) {
 	if setting.TdengineParams == "" || setting.MysqlParams == "" {
 		t.Fatal("expected default database params")
 	}
+	if setting.RestoreBatchSize != 1000 || !setting.RestoreCreateTable {
+		t.Fatalf("unexpected default restore setting: %+v", setting)
+	}
 }
 
 func TestSystemSettingServiceSaveAndGetSyncSetting(t *testing.T) {
@@ -41,12 +44,23 @@ func TestSystemSettingServiceSaveAndGetSyncSetting(t *testing.T) {
 		BackupBatchSize:           500,
 		BackupRetryTimes:          2,
 		BackupRetryIntervalMs:     1500,
+		BackupTimeoutSeconds:      7200,
 		TdengineParams:            `{"timeout":"10m"}`,
 		MysqlParams:               `{"timeout":"3m"}`,
 		SyncBatchSize:             800,
+		SyncRetryTimes:            4,
+		SyncRetryIntervalMs:       2000,
+		SyncTimeoutSeconds:        3600,
+		RestoreBatchSize:          300,
+		RestoreWriteMode:          domains.WriteModeReplace,
+		RestoreCreateTable:        true,
+		RestoreTruncateBefore:     true,
+		HealthCheckIntervalSec:    120,
 		MonitorRefreshSeconds:     8,
+		RunRetentionDays:          15,
 		NotificationRetentionDays: 14,
 		BackupRetentionDays:       21,
+		RestoreRetentionDays:      22,
 		LogLevel:                  "warn",
 	})
 	if err != nil {
@@ -63,6 +77,12 @@ func TestSystemSettingServiceSaveAndGetSyncSetting(t *testing.T) {
 	if got.BackupBatchSize != 500 || got.LogLevel != "warn" || got.TdengineParams != `{"timeout":"10m"}` {
 		t.Fatalf("unexpected saved setting: %+v", got)
 	}
+	if got.RestoreBatchSize != 300 || got.RestoreWriteMode != domains.WriteModeReplace || !got.RestoreTruncateBefore {
+		t.Fatalf("unexpected saved restore setting: %+v", got)
+	}
+	if got.SyncRetryTimes != 4 || got.HealthCheckIntervalSec != 120 || got.RestoreRetentionDays != 22 {
+		t.Fatalf("unexpected saved extended setting: %+v", got)
+	}
 }
 
 func TestSystemSettingServiceRejectInvalidJSONParams(t *testing.T) {
@@ -71,12 +91,22 @@ func TestSystemSettingServiceRejectInvalidJSONParams(t *testing.T) {
 		BackupBatchSize:           1000,
 		BackupRetryTimes:          3,
 		BackupRetryIntervalMs:     3000,
+		BackupTimeoutSeconds:      21600,
 		TdengineParams:            `[1,2]`,
 		MysqlParams:               `{}`,
 		SyncBatchSize:             1000,
+		SyncRetryTimes:            2,
+		SyncRetryIntervalMs:       1500,
+		SyncTimeoutSeconds:        21600,
+		RestoreBatchSize:          1000,
+		RestoreWriteMode:          domains.WriteModeInsert,
+		RestoreCreateTable:        true,
+		HealthCheckIntervalSec:    60,
 		MonitorRefreshSeconds:     5,
+		RunRetentionDays:          30,
 		NotificationRetentionDays: 30,
 		BackupRetentionDays:       30,
+		RestoreRetentionDays:      30,
 		LogLevel:                  "info",
 	})
 	if err == nil {

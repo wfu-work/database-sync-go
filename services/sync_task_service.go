@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"database-sync-go/syncer/connector"
 	"database-sync-go/syncer/manager"
 	"database-sync-go/syncer/mapper"
+	"database-sync-go/syncer/timewindow"
 	"database-sync-go/utils"
 
 	commonServices "github.com/wfu-work/nav-common-go-lib/services"
@@ -22,31 +24,40 @@ type SyncTaskService struct {
 	commonServices.CrudService[domains.SyncTask]
 }
 
+var childTableTemplateVarPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
 func (s SyncTaskService) WithDB(db *gorm.DB) SyncTaskService {
 	s.CrudService = *s.CrudService.WithDB(db)
 	return s
 }
 
 type SaveSyncTaskRequest struct {
-	Guid         string                `json:"guid"`
-	Name         string                `json:"name"`
-	SourceGuid   string                `json:"sourceGuid"`
-	TargetGuid   string                `json:"targetGuid"`
-	SourceTable  string                `json:"sourceTable"`
-	TargetTable  string                `json:"targetTable"`
-	Mode         string                `json:"mode"`
-	CursorField  string                `json:"cursorField"`
-	CursorValue  string                `json:"cursorValue"`
-	BatchSize    int                   `json:"batchSize"`
-	Fields       []mapper.FieldMapping `json:"fields"`
-	FieldMapping string                `json:"fieldMapping"`
-	WriteMode    string                `json:"writeMode"`
-	ConflictKeys string                `json:"conflictKeys"`
-	WhereClause  string                `json:"whereClause"`
-	CronExpr     string                `json:"cronExpr"`
-	ScheduleOn   *int                  `json:"scheduleOn"`
-	Remark       string                `json:"remark"`
-	Status       *int                  `json:"status"`
+	Guid                       string                `json:"guid"`
+	Name                       string                `json:"name"`
+	SourceGuid                 string                `json:"sourceGuid"`
+	TargetGuid                 string                `json:"targetGuid"`
+	SourceTable                string                `json:"sourceTable"`
+	TargetTable                string                `json:"targetTable"`
+	Mode                       string                `json:"mode"`
+	CursorField                string                `json:"cursorField"`
+	CursorValue                string                `json:"cursorValue"`
+	BatchSize                  int                   `json:"batchSize"`
+	Fields                     []mapper.FieldMapping `json:"fields"`
+	FieldMapping               string                `json:"fieldMapping"`
+	WriteMode                  string                `json:"writeMode"`
+	ConflictKeys               string                `json:"conflictKeys"`
+	WhereClause                string                `json:"whereClause"`
+	SyncTimeField              string                `json:"syncTimeField"`
+	SyncStartDate              string                `json:"syncStartDate"`
+	SyncEndDate                string                `json:"syncEndDate"`
+	TDengineChildTableTemplate string                `json:"tdengineChildTableTemplate"`
+	TDengineChildTableField    string                `json:"tdengineChildTableField"`
+	TDengineTags               string                `json:"tdengineTags"`
+	TDengineTagMappings        []mapper.TagMapping   `json:"tdengineTagMappings"`
+	CronExpr                   string                `json:"cronExpr"`
+	ScheduleOn                 *int                  `json:"scheduleOn"`
+	Remark                     string                `json:"remark"`
+	Status                     *int                  `json:"status"`
 }
 
 type ValidateSyncTaskResult struct {
@@ -127,6 +138,13 @@ func (s SyncTaskService) Save(req SaveSyncTaskRequest) (*domains.SyncTask, error
 	req.WriteMode = normalizeWriteMode(req.WriteMode)
 	req.ConflictKeys = strings.TrimSpace(req.ConflictKeys)
 	req.WhereClause = strings.TrimSpace(req.WhereClause)
+	req.SyncTimeField = strings.TrimSpace(req.SyncTimeField)
+	req.SyncStartDate = strings.TrimSpace(req.SyncStartDate)
+	req.SyncEndDate = strings.TrimSpace(req.SyncEndDate)
+	req.TDengineChildTableTemplate = strings.TrimSpace(req.TDengineChildTableTemplate)
+	req.TDengineChildTableField = strings.TrimSpace(req.TDengineChildTableField)
+	req.TDengineChildTableTemplate = normalizeChildTableTemplate(req.TDengineChildTableTemplate, req.TDengineChildTableField)
+	req.TDengineTags = strings.TrimSpace(req.TDengineTags)
 	req.CronExpr = strings.TrimSpace(req.CronExpr)
 	req.Remark = strings.TrimSpace(req.Remark)
 
@@ -165,11 +183,37 @@ func (s SyncTaskService) Save(req SaveSyncTaskRequest) (*domains.SyncTask, error
 	if err != nil {
 		return nil, err
 	}
-	if _, err := ServiceGroupApp.DataSourceService.GetEnabled(req.SourceGuid); err != nil {
+	source, err := ServiceGroupApp.DataSourceService.GetEnabled(req.SourceGuid)
+	if err != nil {
 		return nil, err
 	}
-	if _, err := ServiceGroupApp.DataSourceService.GetEnabled(req.TargetGuid); err != nil {
+	target, err := ServiceGroupApp.DataSourceService.GetEnabled(req.TargetGuid)
+	if err != nil {
 		return nil, err
+	}
+	tdengineTags, err := normalizeTagMapping(req)
+	if err != nil {
+		return nil, err
+	}
+	if isTDengineSource(source) {
+		if req.SyncTimeField == "" {
+			return nil, errors.New("syncTimeField required for tdengine source")
+		}
+		if _, err := timewindow.ParseRange(req.SyncStartDate, req.SyncEndDate, time.Now()); err != nil {
+			return nil, err
+		}
+	}
+	if isTDengineTarget(target) {
+		if req.TDengineChildTableTemplate == "" {
+			return nil, errors.New("tdengineChildTableTemplate required for tdengine target")
+		}
+		if tdengineTags == "" {
+			return nil, errors.New("tdengineTags required for tdengine target")
+		}
+	} else {
+		req.TDengineChildTableTemplate = ""
+		req.TDengineChildTableField = ""
+		tdengineTags = ""
 	}
 
 	status := int(domains.StatusEnabled)
@@ -215,6 +259,12 @@ func (s SyncTaskService) Save(req SaveSyncTaskRequest) (*domains.SyncTask, error
 	row.WriteMode = req.WriteMode
 	row.ConflictKeys = req.ConflictKeys
 	row.WhereClause = req.WhereClause
+	row.SyncTimeField = req.SyncTimeField
+	row.SyncStartDate = req.SyncStartDate
+	row.SyncEndDate = req.SyncEndDate
+	row.TDengineChildTableTemplate = req.TDengineChildTableTemplate
+	row.TDengineChildTableField = req.TDengineChildTableField
+	row.TDengineTags = tdengineTags
 	row.CronExpr = req.CronExpr
 	row.ScheduleOn = scheduleOn
 	row.Remark = req.Remark
@@ -246,8 +296,26 @@ func (s SyncTaskService) Run(guid string) (*domains.SyncRun, error) {
 	return manager.DefaultManager.RunTask(*task)
 }
 
+func (s SyncTaskService) Get(guid string) (*domains.SyncTask, error) {
+	guid = strings.TrimSpace(guid)
+	if guid == "" {
+		return nil, errors.New("task guid required")
+	}
+	var row domains.SyncTask
+	if err := s.DB().Where("guid = ?", guid).First(&row).Error; err != nil {
+		return nil, errors.New("sync task not found")
+	}
+	return &row, nil
+}
+
 func (s SyncTaskService) ValidateRequest(req SaveSyncTaskRequest) (*ValidateSyncTaskResult, error) {
-	result := &ValidateSyncTaskResult{}
+	result := &ValidateSyncTaskResult{
+		Errors:              []string{},
+		SourceColumns:       []connector.ColumnInfo{},
+		TargetColumns:       []connector.ColumnInfo{},
+		MissingSourceFields: []string{},
+		MissingTargetFields: []string{},
+	}
 	req = normalizeSyncTaskRequest(req)
 	result.SourceDatasourceGuid = req.SourceGuid
 	result.TargetDatasourceGuid = req.TargetGuid
@@ -276,6 +344,34 @@ func (s SyncTaskService) ValidateRequest(req SaveSyncTaskRequest) (*ValidateSync
 	if len(result.Errors) > 0 {
 		result.Valid = false
 		return result, nil
+	}
+	var tdengineRange timewindow.Range
+	if isTDengineSource(source) {
+		if req.SyncTimeField == "" {
+			result.Errors = append(result.Errors, "syncTimeField required for tdengine source")
+			result.Valid = false
+			return result, nil
+		}
+		tdengineRange, err = timewindow.ParseRange(req.SyncStartDate, req.SyncEndDate, time.Now())
+		if err != nil {
+			result.Errors = append(result.Errors, err.Error())
+			result.Valid = false
+			return result, nil
+		}
+	}
+	var tagMappings []mapper.TagMapping
+	if isTDengineTarget(target) {
+		if req.TDengineChildTableTemplate == "" {
+			result.Errors = append(result.Errors, "tdengineChildTableTemplate required for tdengine target")
+		}
+		tagMappings, err = tagMappingsFromRequest(req)
+		if err != nil {
+			result.Errors = append(result.Errors, err.Error())
+		}
+		if len(result.Errors) > 0 {
+			result.Valid = false
+			return result, nil
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -313,7 +409,8 @@ func (s SyncTaskService) ValidateRequest(req SaveSyncTaskRequest) (*ValidateSync
 	}
 
 	sourceSet := connector.ColumnSet(sourceColumns)
-	targetSet := connector.ColumnSet(targetColumns)
+	targetSet := connector.ColumnSet(nonTagColumns(targetColumns))
+	targetTagSet := connector.ColumnSet(tagColumns(targetColumns))
 	for _, field := range fields {
 		sourceName := strings.TrimSpace(field.Source)
 		if sourceName != "" && !sourceSet[strings.ToLower(sourceName)] {
@@ -322,6 +419,23 @@ func (s SyncTaskService) ValidateRequest(req SaveSyncTaskRequest) (*ValidateSync
 		targetName := strings.TrimSpace(field.Target)
 		if targetName != "" && !targetSet[strings.ToLower(targetName)] {
 			result.MissingTargetFields = append(result.MissingTargetFields, targetName)
+		}
+	}
+	if isTDengineTarget(target) {
+		for _, field := range childTableTemplateSourceFields(req.TDengineChildTableTemplate, req.TDengineChildTableField) {
+			if !sourceFieldExists(sourceSet, field) {
+				result.MissingSourceFields = append(result.MissingSourceFields, field)
+			}
+		}
+		for _, tag := range tagMappings {
+			tagName := strings.TrimSpace(tag.Name)
+			if tagName != "" && !targetTagSet[strings.ToLower(tagName)] {
+				result.MissingTargetFields = append(result.MissingTargetFields, tagName)
+			}
+			sourceName := strings.TrimSpace(tag.Source)
+			if sourceName != "" && !sourceFieldExists(sourceSet, sourceName) {
+				result.MissingSourceFields = append(result.MissingSourceFields, sourceName)
+			}
 		}
 	}
 	if req.Mode == domains.SyncModeIncremental && !sourceSet[strings.ToLower(req.CursorField)] {
@@ -334,16 +448,35 @@ func (s SyncTaskService) ValidateRequest(req SaveSyncTaskRequest) (*ValidateSync
 		result.Errors = append(result.Errors, "target fields missing: "+strings.Join(uniqueStrings(result.MissingTargetFields), ", "))
 	}
 
-	count, err := sourceConn.Count(ctx, connector.QueryOptions{
+	queryOpts := connector.QueryOptions{
 		Table:       req.SourceTable,
 		WhereClause: req.WhereClause,
 		CursorField: cursorFieldForMode(req.Mode, req.CursorField),
 		CursorValue: req.CursorValue,
-	})
-	if err != nil {
-		result.Errors = append(result.Errors, "source count: "+err.Error())
-	} else {
-		result.EstimatedSourceCount = count
+	}
+	if isTDengineSource(source) {
+		timeField, err := tdengineTimeField(req.SyncTimeField, sourceColumns)
+		if err != nil {
+			result.Errors = append(result.Errors, err.Error())
+			if req.SyncTimeField != "" {
+				result.MissingSourceFields = append(result.MissingSourceFields, req.SyncTimeField)
+			}
+		} else {
+			window := timewindow.FirstDayBackward(tdengineRange)
+			queryOpts.CursorField = timeField
+			queryOpts.CursorValue = ""
+			queryOpts.TimeField = timeField
+			queryOpts.TimeStart = timewindow.FormatSQL(window.Start)
+			queryOpts.TimeEnd = timewindow.FormatSQL(window.End)
+		}
+	}
+	if len(result.Errors) == 0 {
+		count, err := sourceConn.Count(ctx, queryOpts)
+		if err != nil {
+			result.Errors = append(result.Errors, "source count: "+err.Error())
+		} else {
+			result.EstimatedSourceCount = count
+		}
 	}
 	result.MissingSourceFields = uniqueStrings(result.MissingSourceFields)
 	result.MissingTargetFields = uniqueStrings(result.MissingTargetFields)
@@ -385,13 +518,30 @@ func (s SyncTaskService) Preview(guid string, req SyncTaskPreviewRequest) (*Sync
 	defer conn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	rows, err := conn.QueryBatch(ctx, connector.QueryOptions{
+	queryOpts := connector.QueryOptions{
 		Table:       task.SourceTable,
 		WhereClause: task.WhereClause,
 		CursorField: cursorFieldForMode(task.Mode, task.CursorField),
 		CursorValue: task.CursorValue,
 		Limit:       req.Limit,
-	})
+	}
+	if isTDengineSource(source) {
+		tdengineRange, err := timewindow.ParseRange(task.SyncStartDate, task.SyncEndDate, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		timeField, err := tdengineTimeFieldFromConnector(ctx, conn, task.SourceTable, task.SyncTimeField)
+		if err != nil {
+			return nil, err
+		}
+		window := timewindow.FirstDayBackward(tdengineRange)
+		queryOpts.CursorField = timeField
+		queryOpts.CursorValue = ""
+		queryOpts.TimeField = timeField
+		queryOpts.TimeStart = timewindow.FormatSQL(window.Start)
+		queryOpts.TimeEnd = timewindow.FormatSQL(window.End)
+	}
+	rows, err := conn.QueryBatch(ctx, queryOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -503,6 +653,13 @@ func normalizeSyncTaskRequest(req SaveSyncTaskRequest) SaveSyncTaskRequest {
 	req.WriteMode = normalizeWriteMode(req.WriteMode)
 	req.ConflictKeys = strings.TrimSpace(req.ConflictKeys)
 	req.WhereClause = strings.TrimSpace(req.WhereClause)
+	req.SyncTimeField = strings.TrimSpace(req.SyncTimeField)
+	req.SyncStartDate = strings.TrimSpace(req.SyncStartDate)
+	req.SyncEndDate = strings.TrimSpace(req.SyncEndDate)
+	req.TDengineChildTableTemplate = strings.TrimSpace(req.TDengineChildTableTemplate)
+	req.TDengineChildTableField = strings.TrimSpace(req.TDengineChildTableField)
+	req.TDengineChildTableTemplate = normalizeChildTableTemplate(req.TDengineChildTableTemplate, req.TDengineChildTableField)
+	req.TDengineTags = strings.TrimSpace(req.TDengineTags)
 	req.CronExpr = strings.TrimSpace(req.CronExpr)
 	req.Remark = strings.TrimSpace(req.Remark)
 	if req.BatchSize <= 0 {
@@ -526,6 +683,38 @@ func fieldsFromRequest(req SaveSyncTaskRequest) ([]mapper.FieldMapping, error) {
 		return nil, err
 	}
 	return fields, nil
+}
+
+func normalizeTagMapping(req SaveSyncTaskRequest) (string, error) {
+	tags, err := tagMappingsFromRequest(req)
+	if err != nil {
+		return "", err
+	}
+	if len(tags) == 0 {
+		return "", nil
+	}
+	data, err := json.Marshal(tags)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func tagMappingsFromRequest(req SaveSyncTaskRequest) ([]mapper.TagMapping, error) {
+	if len(req.TDengineTagMappings) > 0 {
+		return req.TDengineTagMappings, mapper.ValidateTags(req.TDengineTagMappings)
+	}
+	if strings.TrimSpace(req.TDengineTags) == "" {
+		return nil, nil
+	}
+	var tags []mapper.TagMapping
+	if err := json.Unmarshal([]byte(req.TDengineTags), &tags); err != nil {
+		return nil, err
+	}
+	if err := mapper.ValidateTags(tags); err != nil {
+		return nil, err
+	}
+	return tags, nil
 }
 
 func validateRequiredTaskFields(req SaveSyncTaskRequest, result *ValidateSyncTaskResult) {
@@ -553,24 +742,30 @@ func requestFromTask(task domains.SyncTask) SaveSyncTaskRequest {
 	status := task.Status
 	scheduleOn := task.ScheduleOn
 	return SaveSyncTaskRequest{
-		Guid:         task.Guid,
-		Name:         task.Name,
-		SourceGuid:   task.SourceGuid,
-		TargetGuid:   task.TargetGuid,
-		SourceTable:  task.SourceTable,
-		TargetTable:  task.TargetTable,
-		Mode:         task.Mode,
-		CursorField:  task.CursorField,
-		CursorValue:  task.CursorValue,
-		BatchSize:    task.BatchSize,
-		FieldMapping: task.FieldMapping,
-		WriteMode:    task.WriteMode,
-		ConflictKeys: task.ConflictKeys,
-		WhereClause:  task.WhereClause,
-		CronExpr:     task.CronExpr,
-		ScheduleOn:   &scheduleOn,
-		Remark:       task.Remark,
-		Status:       &status,
+		Guid:                       task.Guid,
+		Name:                       task.Name,
+		SourceGuid:                 task.SourceGuid,
+		TargetGuid:                 task.TargetGuid,
+		SourceTable:                task.SourceTable,
+		TargetTable:                task.TargetTable,
+		Mode:                       task.Mode,
+		CursorField:                task.CursorField,
+		CursorValue:                task.CursorValue,
+		BatchSize:                  task.BatchSize,
+		FieldMapping:               task.FieldMapping,
+		WriteMode:                  task.WriteMode,
+		ConflictKeys:               task.ConflictKeys,
+		WhereClause:                task.WhereClause,
+		SyncTimeField:              task.SyncTimeField,
+		SyncStartDate:              task.SyncStartDate,
+		SyncEndDate:                task.SyncEndDate,
+		TDengineChildTableTemplate: normalizeChildTableTemplate(task.TDengineChildTableTemplate, task.TDengineChildTableField),
+		TDengineChildTableField:    task.TDengineChildTableField,
+		TDengineTags:               task.TDengineTags,
+		CronExpr:                   task.CronExpr,
+		ScheduleOn:                 &scheduleOn,
+		Remark:                     task.Remark,
+		Status:                     &status,
 	}
 }
 
@@ -579,6 +774,113 @@ func cursorFieldForMode(mode string, cursorField string) string {
 		return strings.TrimSpace(cursorField)
 	}
 	return ""
+}
+
+func isTDengineSource(source *domains.DataSource) bool {
+	return source != nil && strings.EqualFold(strings.TrimSpace(source.Type), domains.DataSourceTypeTDengine)
+}
+
+func isTDengineTarget(target *domains.DataSource) bool {
+	return target != nil && strings.EqualFold(strings.TrimSpace(target.Type), domains.DataSourceTypeTDengine)
+}
+
+func normalizeChildTableTemplate(template string, legacyField string) string {
+	template = strings.TrimSpace(template)
+	if template != "" {
+		return template
+	}
+	return strings.TrimSpace(legacyField)
+}
+
+func childTableTemplateFields(template string) []string {
+	template = strings.TrimSpace(template)
+	if template == "" {
+		return nil
+	}
+	matches := childTableTemplateVarPattern.FindAllStringSubmatch(template, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	fields := make([]string, 0, len(matches))
+	seen := map[string]bool{}
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		field := strings.TrimSpace(match[1])
+		key := strings.ToLower(field)
+		if field == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		fields = append(fields, field)
+	}
+	return fields
+}
+
+func childTableTemplateSourceFields(template string, legacyField string) []string {
+	fields := childTableTemplateFields(template)
+	if len(fields) > 0 {
+		return fields
+	}
+	template = strings.TrimSpace(template)
+	legacyField = strings.TrimSpace(legacyField)
+	if legacyField != "" && strings.EqualFold(template, legacyField) {
+		return []string{legacyField}
+	}
+	return nil
+}
+
+func sourceFieldExists(sourceSet map[string]bool, field string) bool {
+	field = strings.ToLower(strings.TrimSpace(field))
+	if field == "" {
+		return false
+	}
+	return sourceSet[field] || field == "tbname"
+}
+
+func tagColumns(columns []connector.ColumnInfo) []connector.ColumnInfo {
+	out := make([]connector.ColumnInfo, 0)
+	for _, column := range columns {
+		if column.IsTag {
+			out = append(out, column)
+		}
+	}
+	return out
+}
+
+func nonTagColumns(columns []connector.ColumnInfo) []connector.ColumnInfo {
+	out := make([]connector.ColumnInfo, 0, len(columns))
+	for _, column := range columns {
+		if !column.IsTag {
+			out = append(out, column)
+		}
+	}
+	return out
+}
+
+func tdengineTimeField(syncTimeField string, columns []connector.ColumnInfo) (string, error) {
+	syncTimeField = strings.TrimSpace(syncTimeField)
+	if syncTimeField == "" {
+		return "", errors.New("syncTimeField required for tdengine source")
+	}
+	if len(columns) == 0 {
+		return "", errors.New("tdengine source columns not found")
+	}
+	for _, column := range columns {
+		if strings.EqualFold(column.Name, syncTimeField) {
+			return column.Name, nil
+		}
+	}
+	return "", fmt.Errorf("syncTimeField not found in source fields: %s", syncTimeField)
+}
+
+func tdengineTimeFieldFromConnector(ctx context.Context, conn connector.Connector, table string, syncTimeField string) (string, error) {
+	columns, err := conn.DescribeTable(ctx, table)
+	if err != nil {
+		return "", err
+	}
+	return tdengineTimeField(syncTimeField, columns)
 }
 
 func uniqueStrings(values []string) []string {

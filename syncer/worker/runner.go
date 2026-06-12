@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
+	"time"
 
 	"database-sync-go/domains"
 	"database-sync-go/syncer/connector"
 	"database-sync-go/syncer/mapper"
+	"database-sync-go/syncer/timewindow"
 
 	"github.com/wfu-work/nav-common-go-lib/global"
 	"go.uber.org/zap"
@@ -19,6 +22,8 @@ import (
 type Runner struct {
 	db *gorm.DB
 }
+
+var childTableTemplateVarPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 func NewRunner(db *gorm.DB) Runner {
 	return Runner{db: db}
@@ -120,6 +125,10 @@ func (r Runner) execute(ctx context.Context, task domains.SyncTask, run *domains
 	if err := mapper.Validate(fields); err != nil {
 		return err
 	}
+	writeOpts, err := writeOptions(task, fields)
+	if err != nil {
+		return err
+	}
 
 	var source domains.DataSource
 	if err := r.db.Where("guid = ? AND status = ?", task.SourceGuid, int(domains.StatusEnabled)).First(&source).Error; err != nil {
@@ -140,6 +149,9 @@ func (r Runner) execute(ctx context.Context, task domains.SyncTask, run *domains
 		return err
 	}
 	defer targetConn.Close()
+	if strings.EqualFold(strings.TrimSpace(source.Type), domains.DataSourceTypeTDengine) {
+		return r.executeTDengine(ctx, task, run, sourceConn, targetConn, fields)
+	}
 
 	queryOpts := connector.QueryOptions{
 		Table:       task.SourceTable,
@@ -197,11 +209,7 @@ func (r Runner) execute(ctx context.Context, task domains.SyncTask, run *domains
 			continue
 		}
 
-		affected, err := targetConn.WriteBatch(ctx, mappedRows, connector.WriteOptions{
-			Table:        task.TargetTable,
-			WriteMode:    task.WriteMode,
-			ConflictKeys: splitCSV(task.ConflictKeys),
-		})
+		affected, err := targetConn.WriteBatch(ctx, rowsForWrite(task, mappedRows, rows), writeOpts)
 		if err != nil {
 			if task.CursorField != "" {
 				cursorValue = lastCursor(rows, task.CursorField, cursorValue)
@@ -230,12 +238,119 @@ func (r Runner) execute(ctx context.Context, task domains.SyncTask, run *domains
 	return nil
 }
 
+func (r Runner) executeTDengine(ctx context.Context, task domains.SyncTask, run *domains.SyncRun, sourceConn connector.Connector, targetConn connector.Connector, fields []mapper.FieldMapping) error {
+	writeOpts, err := writeOptions(task, fields)
+	if err != nil {
+		return err
+	}
+	syncRange, err := timewindow.ParseRange(task.SyncStartDate, task.SyncEndDate, time.Now())
+	if err != nil {
+		return err
+	}
+	timeField, err := tdengineTimeField(ctx, sourceConn, task)
+	if err != nil {
+		return err
+	}
+	batchSize := task.BatchSize
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	extraSelectFields := tdengineExtraSelectFields(task, writeOpts.TDengineTagMappings)
+	cursorValue := task.CursorValue
+	cursorCaptured := false
+	total := int64(0)
+
+	return timewindow.ForEachDayBackward(ctx, syncRange, func(window timewindow.Window) error {
+		baseOpts := connector.QueryOptions{
+			Table:             task.SourceTable,
+			WhereClause:       task.WhereClause,
+			CursorField:       timeField,
+			CursorValue:       "",
+			TimeField:         timeField,
+			TimeStart:         timewindow.FormatSQL(window.Start),
+			TimeEnd:           timewindow.FormatSQL(window.End),
+			ExtraSelectFields: extraSelectFields,
+		}
+		count, err := sourceConn.Count(ctx, baseOpts)
+		if err != nil {
+			return err
+		}
+		total += count
+		if err := r.db.Model(&domains.SyncRun{}).Where("guid = ?", run.Guid).Updates(map[string]any{
+			"total_count": total,
+			"update_time": domains.NowMilli(),
+		}).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return nil
+		}
+		captureCursor := !cursorCaptured
+
+		for offset := 0; ; {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			queryOpts := baseOpts
+			queryOpts.Limit = batchSize
+			queryOpts.Offset = offset
+			rows, err := sourceConn.QueryBatch(ctx, queryOpts)
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				break
+			}
+
+			mappedRows, err := mapper.MapRows(rows, fields)
+			if err != nil {
+				if captureCursor {
+					cursorValue = lastCursor(rows, timeField, cursorValue)
+					cursorCaptured = true
+				}
+				r.recordBatchError(run.Guid, task.Guid, rows, timeField, err)
+				r.incrementRun(run.Guid, int64(len(rows)), 0, int64(len(rows)), cursorValue, err.Error())
+				offset += len(rows)
+				continue
+			}
+			affected, err := targetConn.WriteBatch(ctx, rowsForWrite(task, mappedRows, rows), writeOpts)
+			if err != nil {
+				if captureCursor {
+					cursorValue = lastCursor(rows, timeField, cursorValue)
+					cursorCaptured = true
+				}
+				r.recordBatchError(run.Guid, task.Guid, rows, timeField, err)
+				r.incrementRun(run.Guid, int64(len(rows)), 0, int64(len(rows)), cursorValue, err.Error())
+				offset += len(rows)
+				continue
+			}
+
+			if captureCursor {
+				cursorValue = lastCursor(rows, timeField, cursorValue)
+				cursorCaptured = true
+			}
+			r.incrementRun(run.Guid, int64(len(rows)), affected, 0, cursorValue, "")
+			offset += len(rows)
+			if len(rows) < batchSize {
+				break
+			}
+		}
+		return nil
+	})
+}
+
 func (r Runner) executeRetry(ctx context.Context, task domains.SyncTask, errorsToRetry []domains.SyncError, run *domains.SyncRun) error {
 	var fields []mapper.FieldMapping
 	if err := json.Unmarshal([]byte(task.FieldMapping), &fields); err != nil {
 		return err
 	}
 	if err := mapper.Validate(fields); err != nil {
+		return err
+	}
+	writeOpts, err := writeOptions(task, fields)
+	if err != nil {
 		return err
 	}
 
@@ -285,11 +400,7 @@ func (r Runner) executeRetry(ctx context.Context, task domains.SyncTask, errorsT
 			r.incrementRun(run.Guid, int64(len(rows)), 0, int64(len(rows)), "", err.Error())
 			continue
 		}
-		affected, err := targetConn.WriteBatch(ctx, mappedRows, connector.WriteOptions{
-			Table:        task.TargetTable,
-			WriteMode:    task.WriteMode,
-			ConflictKeys: splitCSV(task.ConflictKeys),
-		})
+		affected, err := targetConn.WriteBatch(ctx, rowsForWrite(task, mappedRows, rows), writeOpts)
 		if err != nil {
 			r.recordBatchError(run.Guid, task.Guid, rows, task.CursorField, err)
 			r.incrementRun(run.Guid, int64(len(rows)), 0, int64(len(rows)), "", err.Error())
@@ -443,6 +554,148 @@ func splitCSV(value string) []string {
 	return out
 }
 
+func writeOptions(task domains.SyncTask, fields []mapper.FieldMapping) (connector.WriteOptions, error) {
+	tags, err := taskTagMappings(task)
+	if err != nil {
+		return connector.WriteOptions{}, err
+	}
+	return connector.WriteOptions{
+		Table:                      task.TargetTable,
+		WriteMode:                  task.WriteMode,
+		ConflictKeys:               splitCSV(task.ConflictKeys),
+		InsertColumns:              mappedTargetColumns(fields),
+		TDengineChildTableTemplate: childTableTemplate(task),
+		TDengineChildTableField:    task.TDengineChildTableField,
+		TDengineTagMappings:        tags,
+	}, nil
+}
+
+func mappedTargetColumns(fields []mapper.FieldMapping) []string {
+	columns := make([]string, 0, len(fields))
+	seen := map[string]bool{}
+	for _, field := range fields {
+		target := strings.TrimSpace(field.Target)
+		key := strings.ToLower(target)
+		if target == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		columns = append(columns, target)
+	}
+	return columns
+}
+
+func taskTagMappings(task domains.SyncTask) ([]mapper.TagMapping, error) {
+	var tags []mapper.TagMapping
+	if strings.TrimSpace(task.TDengineTags) == "" {
+		return tags, nil
+	}
+	if err := json.Unmarshal([]byte(task.TDengineTags), &tags); err != nil {
+		return nil, err
+	}
+	if err := mapper.ValidateTags(tags); err != nil {
+		return nil, err
+	}
+	return tags, nil
+}
+
+func tdengineExtraSelectFields(task domains.SyncTask, tags []mapper.TagMapping) []string {
+	fields := make([]string, 0, len(tags)+1)
+	seen := map[string]bool{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		key := strings.ToLower(value)
+		if value == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		fields = append(fields, value)
+	}
+	for _, field := range childTableTemplateSourceFields(childTableTemplate(task), task.TDengineChildTableField) {
+		add(field)
+	}
+	for _, tag := range tags {
+		add(tag.Source)
+	}
+	return fields
+}
+
+func mergeSourceRows(mappedRows []mapper.Row, sourceRows []mapper.Row) []mapper.Row {
+	if len(mappedRows) == 0 || len(sourceRows) == 0 {
+		return mappedRows
+	}
+	out := make([]mapper.Row, 0, len(mappedRows))
+	for i, mapped := range mappedRows {
+		merged := mapper.Row{}
+		for key, value := range mapped {
+			merged[key] = value
+		}
+		if i < len(sourceRows) {
+			for key, value := range sourceRows[i] {
+				if _, exists := merged[key]; !exists {
+					merged[key] = value
+				}
+			}
+		}
+		out = append(out, merged)
+	}
+	return out
+}
+
+func rowsForWrite(task domains.SyncTask, mappedRows []mapper.Row, sourceRows []mapper.Row) []mapper.Row {
+	if childTableTemplate(task) == "" {
+		return mappedRows
+	}
+	return mergeSourceRows(mappedRows, sourceRows)
+}
+
+func childTableTemplate(task domains.SyncTask) string {
+	template := strings.TrimSpace(task.TDengineChildTableTemplate)
+	if template != "" {
+		return template
+	}
+	return strings.TrimSpace(task.TDengineChildTableField)
+}
+
+func childTableTemplateFields(template string) []string {
+	template = strings.TrimSpace(template)
+	if template == "" {
+		return nil
+	}
+	matches := childTableTemplateVarPattern.FindAllStringSubmatch(template, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	fields := make([]string, 0, len(matches))
+	seen := map[string]bool{}
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		field := strings.TrimSpace(match[1])
+		key := strings.ToLower(field)
+		if field == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		fields = append(fields, field)
+	}
+	return fields
+}
+
+func childTableTemplateSourceFields(template string, legacyField string) []string {
+	fields := childTableTemplateFields(template)
+	if len(fields) > 0 {
+		return fields
+	}
+	template = strings.TrimSpace(template)
+	legacyField = strings.TrimSpace(legacyField)
+	if legacyField != "" && strings.EqualFold(template, legacyField) {
+		return []string{legacyField}
+	}
+	return nil
+}
+
 func lastCursor(rows []mapper.Row, cursorField string, fallback string) string {
 	if len(rows) == 0 {
 		return fallback
@@ -452,4 +705,24 @@ func lastCursor(rows []mapper.Row, cursorField string, fallback string) string {
 		return fallback
 	}
 	return fmt.Sprint(value)
+}
+
+func tdengineTimeField(ctx context.Context, sourceConn connector.Connector, task domains.SyncTask) (string, error) {
+	syncTimeField := strings.TrimSpace(task.SyncTimeField)
+	if syncTimeField == "" {
+		return "", errors.New("syncTimeField required for tdengine source")
+	}
+	columns, err := sourceConn.DescribeTable(ctx, task.SourceTable)
+	if err != nil {
+		return "", err
+	}
+	if len(columns) == 0 {
+		return "", errors.New("tdengine source columns not found")
+	}
+	for _, column := range columns {
+		if strings.EqualFold(column.Name, syncTimeField) {
+			return column.Name, nil
+		}
+	}
+	return "", fmt.Errorf("syncTimeField not found in source fields: %s", syncTimeField)
 }
