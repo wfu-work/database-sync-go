@@ -25,6 +25,7 @@ type SyncTaskService struct {
 }
 
 var childTableTemplateVarPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+var errPreviewSampleFound = errors.New("preview sample found")
 
 func (s SyncTaskService) WithDB(db *gorm.DB) SyncTaskService {
 	s.CrudService = *s.CrudService.WithDB(db)
@@ -80,9 +81,12 @@ type SyncTaskPreviewRequest struct {
 }
 
 type SyncTaskPreviewResult struct {
-	SourceRows []mapper.Row `json:"sourceRows"`
-	MappedRows []mapper.Row `json:"mappedRows"`
-	Count      int          `json:"count"`
+	SourceRows        []mapper.Row `json:"sourceRows"`
+	MappedRows        []mapper.Row `json:"mappedRows"`
+	Count             int          `json:"count"`
+	SampleWindowStart string       `json:"sampleWindowStart"`
+	SampleWindowEnd   string       `json:"sampleWindowEnd"`
+	ScannedDays       int          `json:"scannedDays"`
 }
 
 func (s SyncTaskService) List(params map[string]string) ([]domains.SyncTask, int64, error) {
@@ -525,6 +529,10 @@ func (s SyncTaskService) Preview(guid string, req SyncTaskPreviewRequest) (*Sync
 		CursorValue: task.CursorValue,
 		Limit:       req.Limit,
 	}
+	var sampleWindowStart string
+	var sampleWindowEnd string
+	var scannedDays int
+	rows := make([]mapper.Row, 0)
 	if isTDengineSource(source) {
 		tdengineRange, err := timewindow.ParseRange(task.SyncStartDate, task.SyncEndDate, time.Now())
 		if err != nil {
@@ -534,22 +542,47 @@ func (s SyncTaskService) Preview(guid string, req SyncTaskPreviewRequest) (*Sync
 		if err != nil {
 			return nil, err
 		}
-		window := timewindow.FirstDayBackward(tdengineRange)
-		queryOpts.CursorField = timeField
-		queryOpts.CursorValue = ""
-		queryOpts.TimeField = timeField
-		queryOpts.TimeStart = timewindow.FormatSQL(window.Start)
-		queryOpts.TimeEnd = timewindow.FormatSQL(window.End)
-	}
-	rows, err := conn.QueryBatch(ctx, queryOpts)
-	if err != nil {
-		return nil, err
+		err = timewindow.ForEachDayBackward(ctx, tdengineRange, func(window timewindow.Window) error {
+			scannedDays++
+			windowOpts := queryOpts
+			windowOpts.CursorField = timeField
+			windowOpts.CursorValue = ""
+			windowOpts.TimeField = timeField
+			windowOpts.TimeStart = timewindow.FormatSQL(window.Start)
+			windowOpts.TimeEnd = timewindow.FormatSQL(window.End)
+			batch, err := conn.QueryBatch(ctx, windowOpts)
+			if err != nil {
+				return err
+			}
+			if len(batch) == 0 {
+				return nil
+			}
+			rows = batch
+			sampleWindowStart = windowOpts.TimeStart
+			sampleWindowEnd = windowOpts.TimeEnd
+			return errPreviewSampleFound
+		})
+		if err != nil && !errors.Is(err, errPreviewSampleFound) {
+			return nil, err
+		}
+	} else {
+		rows, err = conn.QueryBatch(ctx, queryOpts)
+		if err != nil {
+			return nil, err
+		}
 	}
 	mapped, err := mapper.MapRows(rows, fields)
 	if err != nil {
 		return nil, err
 	}
-	return &SyncTaskPreviewResult{SourceRows: rows, MappedRows: mapped, Count: len(rows)}, nil
+	return &SyncTaskPreviewResult{
+		SourceRows:        rows,
+		MappedRows:        mapped,
+		Count:             len(rows),
+		SampleWindowStart: sampleWindowStart,
+		SampleWindowEnd:   sampleWindowEnd,
+		ScannedDays:       scannedDays,
+	}, nil
 }
 
 func (s SyncTaskService) Stop(guid string) error {
