@@ -16,6 +16,8 @@ type ServiceGroup struct {
 	SyncRunService
 	SyncErrorService
 	DatabaseBackupService
+	EventNotificationService
+	SystemSettingService
 }
 
 func PageResult(items any, total int64, params map[string]string) commonDomains.PageResult {

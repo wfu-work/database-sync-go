@@ -48,6 +48,7 @@ func (r Runner) Run(ctx context.Context, task domains.SyncTask, run domains.Sync
 		}
 		r.finishRun(run.Guid, domains.RunStatusFailed, cursorEnd, err)
 		_ = r.updateTaskRun(task.Guid, firstNonEmpty(cursorEnd, task.CursorValue), run.Guid, domains.RunStatusFailed)
+		r.notifySyncRunFinished(task, run.Guid, domains.RunStatusFailed, err)
 		global.NAV_LOG.Error("sync task failed", zap.String("task", task.Guid), zap.String("run", run.Guid), zap.Error(err))
 		return
 	}
@@ -56,12 +57,14 @@ func (r Runner) Run(ctx context.Context, task domains.SyncTask, run domains.Sync
 		err := fmt.Errorf("sync finished with %d failed rows", failedCount)
 		r.finishRun(run.Guid, domains.RunStatusFailed, cursorEnd, err)
 		_ = r.updateTaskRun(task.Guid, firstNonEmpty(cursorEnd, task.CursorValue), run.Guid, domains.RunStatusFailed)
+		r.notifySyncRunFinished(task, run.Guid, domains.RunStatusFailed, err)
 		global.NAV_LOG.Warn("sync task finished with failed rows", zap.String("task", task.Guid), zap.String("run", run.Guid), zap.Int64("failed", failedCount))
 		return
 	}
 
 	r.finishRun(run.Guid, domains.RunStatusSuccess, cursorEnd, nil)
 	_ = r.updateTaskRun(task.Guid, firstNonEmpty(cursorEnd, task.CursorValue), run.Guid, domains.RunStatusSuccess)
+	r.notifySyncRunFinished(task, run.Guid, domains.RunStatusSuccess, nil)
 	global.NAV_LOG.Info("sync task success", zap.String("task", task.Guid), zap.String("run", run.Guid))
 }
 
@@ -90,6 +93,7 @@ func (r Runner) RetryErrors(ctx context.Context, task domains.SyncTask, errorsTo
 		}
 		r.finishRun(run.Guid, domains.RunStatusFailed, cursorEnd, err)
 		_ = r.updateTaskRun(task.Guid, firstNonEmpty(cursorEnd, task.CursorValue), run.Guid, domains.RunStatusFailed)
+		r.notifySyncRunFinished(task, run.Guid, domains.RunStatusFailed, err)
 		global.NAV_LOG.Error("retry sync errors failed", zap.String("task", task.Guid), zap.String("run", run.Guid), zap.Error(err))
 		return
 	}
@@ -98,11 +102,13 @@ func (r Runner) RetryErrors(ctx context.Context, task domains.SyncTask, errorsTo
 		err := fmt.Errorf("retry finished with %d failed rows", failedCount)
 		r.finishRun(run.Guid, domains.RunStatusFailed, cursorEnd, err)
 		_ = r.updateTaskRun(task.Guid, firstNonEmpty(cursorEnd, task.CursorValue), run.Guid, domains.RunStatusFailed)
+		r.notifySyncRunFinished(task, run.Guid, domains.RunStatusFailed, err)
 		global.NAV_LOG.Warn("retry sync errors finished with failed rows", zap.String("task", task.Guid), zap.String("run", run.Guid), zap.Int64("failed", failedCount))
 		return
 	}
 	r.finishRun(run.Guid, domains.RunStatusSuccess, cursorEnd, nil)
 	_ = r.updateTaskRun(task.Guid, firstNonEmpty(cursorEnd, task.CursorValue), run.Guid, domains.RunStatusSuccess)
+	r.notifySyncRunFinished(task, run.Guid, domains.RunStatusSuccess, nil)
 	global.NAV_LOG.Info("retry sync errors success", zap.String("task", task.Guid), zap.String("run", run.Guid))
 }
 
@@ -365,6 +371,39 @@ func (r Runner) updateTaskRun(taskGuid string, cursorValue string, runGuid strin
 		"last_run_status": status,
 		"update_time":     domains.NowMilli(),
 	}).Error
+}
+
+func (r Runner) notifySyncRunFinished(task domains.SyncTask, runGuid string, status string, err error) {
+	level := domains.EventLevelInfo
+	eventType := domains.EventTypeSyncRunSuccess
+	title := "同步任务完成"
+	content := fmt.Sprintf("同步任务 %s 已完成。", task.Name)
+	if status != domains.RunStatusSuccess {
+		level = domains.EventLevelError
+		eventType = domains.EventTypeSyncRunFailed
+		title = "同步任务失败"
+		content = fmt.Sprintf("同步任务 %s 执行失败。", task.Name)
+		if err != nil {
+			content += "原因：" + err.Error()
+		}
+	}
+	now := domains.NowMilli()
+	row := domains.EventNotification{
+		Type:       eventType,
+		Level:      level,
+		Title:      title,
+		Content:    content,
+		SourceType: domains.EventSourceSyncRun,
+		SourceGuid: runGuid,
+		SourceName: task.Name,
+		Read:       0,
+		EventTime:  now,
+	}
+	row.CreateTime = now
+	row.UpdateTime = now
+	if createErr := r.db.Create(&row).Error; createErr != nil {
+		global.NAV_LOG.Warn("create sync run notification failed", zap.String("run", runGuid), zap.Error(createErr))
+	}
 }
 
 func (r Runner) currentRunCursor(runGuid string) string {

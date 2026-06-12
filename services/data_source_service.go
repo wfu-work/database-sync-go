@@ -39,19 +39,22 @@ type SaveDataSourceRequest struct {
 }
 
 type PublicDataSource struct {
-	Guid       string `json:"guid"`
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	Username   string `json:"username"`
-	Password   string `json:"password"`
-	Database   string `json:"database"`
-	Params     string `json:"params"`
-	Remark     string `json:"remark"`
-	Status     int    `json:"status"`
-	CreateTime int64  `json:"createTime"`
-	UpdateTime int64  `json:"updateTime"`
+	Guid                string `json:"guid"`
+	Name                string `json:"name"`
+	Type                string `json:"type"`
+	Host                string `json:"host"`
+	Port                int    `json:"port"`
+	Username            string `json:"username"`
+	Password            string `json:"password"`
+	Database            string `json:"database"`
+	Params              string `json:"params"`
+	Remark              string `json:"remark"`
+	ConnectionStatus    string `json:"connectionStatus"`
+	ConnectionCheckedAt int64  `json:"connectionCheckedAt"`
+	ConnectionError     string `json:"connectionError"`
+	Status              int    `json:"status"`
+	CreateTime          int64  `json:"createTime"`
+	UpdateTime          int64  `json:"updateTime"`
 }
 
 type PreviewTableRequest struct {
@@ -223,12 +226,7 @@ func (s DataSourceService) TestConnection(guid string) error {
 	if err != nil {
 		return err
 	}
-	conn, err := connector.New(*source)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	return conn.Test()
+	return checkDataSourceConnection(*source)
 }
 
 func (s DataSourceService) Tables(guid string) ([]connector.TableInfo, error) {
@@ -339,19 +337,26 @@ func publicDataSources(items []domains.DataSource) []PublicDataSource {
 }
 
 func publicDataSource(item domains.DataSource) *PublicDataSource {
+	connectionStatus := strings.TrimSpace(item.ConnectionStatus)
+	if connectionStatus == "" {
+		connectionStatus = domains.DataSourceConnectionUnknown
+	}
 	return &PublicDataSource{
-		Guid:       item.Guid,
-		Name:       item.Name,
-		Type:       item.Type,
-		Host:       item.Host,
-		Port:       item.Port,
-		Username:   item.Username,
-		Password:   utils.MaskSecret(item.Password),
-		Database:   item.Database,
-		Params:     item.Params,
-		Remark:     item.Remark,
-		Status:     item.Status,
-		CreateTime: item.CreateTime,
-		UpdateTime: item.UpdateTime,
+		Guid:                item.Guid,
+		Name:                item.Name,
+		Type:                item.Type,
+		Host:                item.Host,
+		Port:                item.Port,
+		Username:            item.Username,
+		Password:            utils.MaskSecret(item.Password),
+		Database:            item.Database,
+		Params:              item.Params,
+		Remark:              item.Remark,
+		ConnectionStatus:    connectionStatus,
+		ConnectionCheckedAt: item.ConnectionCheckedAt,
+		ConnectionError:     item.ConnectionError,
+		Status:              item.Status,
+		CreateTime:          item.CreateTime,
+		UpdateTime:          item.UpdateTime,
 	}
 }

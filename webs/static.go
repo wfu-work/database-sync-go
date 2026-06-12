@@ -2,7 +2,7 @@ package webs
 
 import _ "embed"
 
-//go:embed navmesh-web.zip
+//go:embed database-sync-web.zip
 var staticFile []byte
 
 func Static() []byte {

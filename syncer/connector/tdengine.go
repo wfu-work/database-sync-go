@@ -246,7 +246,13 @@ func (c *TDengineConnector) exec(ctx context.Context, sqlText string) (*tdengine
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(parsed.Status, "succ") && !strings.EqualFold(parsed.Status, "success") {
+	if parsed.Status != "" && !strings.EqualFold(parsed.Status, "succ") && !strings.EqualFold(parsed.Status, "success") {
+		if parsed.Desc == "" {
+			parsed.Desc = strings.TrimSpace(string(body))
+		}
+		return nil, errors.New(parsed.Desc)
+	}
+	if parsed.Status == "" && parsed.Code != 0 {
 		if parsed.Desc == "" {
 			parsed.Desc = strings.TrimSpace(string(body))
 		}

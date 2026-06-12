@@ -75,6 +75,43 @@ func (a DatabaseBackupApi) Start(c *gin.Context) {
 	response.Ok(item, c)
 }
 
+// Retry 重试失败的数据库备份
+// @Summary 重试失败的数据库备份
+// @Description 使用原备份记录的数据源和表范围，在原记录上重新开始异步备份
+// @Tags 数据同步-数据库备份
+// @Security ApiKeyAuth
+// @Accept json
+// @Produce json
+// @Param guid path string true "备份 GUID"
+// @Success 200 {object} response.Response{data=domains.DatabaseBackup,msg=string} "数据库备份已重新开始"
+// @Router /backups/{guid}/retry [post]
+func (a DatabaseBackupApi) Retry(c *gin.Context) {
+	item, err := backupService.Retry(c.Param("guid"))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(item, c)
+}
+
+// Delete 删除数据库备份记录
+// @Summary 删除数据库备份记录
+// @Description 删除已结束的数据库备份记录，并清理对应备份文件。等待中或备份中的记录不允许删除
+// @Tags 数据同步-数据库备份
+// @Security ApiKeyAuth
+// @Accept json
+// @Produce json
+// @Param guid path string true "备份 GUID"
+// @Success 200 {object} response.Response{data=bool,msg=string} "删除数据库备份记录成功"
+// @Router /backups/{guid} [delete]
+func (a DatabaseBackupApi) Delete(c *gin.Context) {
+	if err := backupService.Delete(c.Param("guid")); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(true, c)
+}
+
 // Download 下载数据库备份文件
 // @Summary 下载数据库备份文件
 // @Description 下载已成功完成的数据库备份 zip 文件

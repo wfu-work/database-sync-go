@@ -50,6 +50,8 @@ func registerTables() {
 		domains.SyncRun{},
 		domains.SyncError{},
 		domains.DatabaseBackup{},
+		domains.EventNotification{},
+		domains.SystemSetting{},
 	)
 	if err != nil {
 		global.NAV_LOG.Error("register datasync business table failed", zap.Error(err))
@@ -65,12 +67,19 @@ func startBackgroundServices() {
 	if err := manager.DefaultManager.RecoverStaleRuns(); err != nil {
 		global.NAV_LOG.Warn("recover datasync stale runs failed", zap.Error(err))
 	}
+	if err := services.ServiceGroupApp.DatabaseBackupService.RecoverStaleBackups(); err != nil {
+		global.NAV_LOG.Warn("recover datasync stale backups failed", zap.Error(err))
+	}
 	if err := manager.DefaultManager.StartScheduler(); err != nil {
 		global.NAV_LOG.Warn("start datasync scheduler failed", zap.Error(err))
+	}
+	if err := services.StartDataSourceHealthChecker(); err != nil {
+		global.NAV_LOG.Warn("start datasync datasource health checker failed", zap.Error(err))
 	}
 }
 
 func stopBackgroundServices() {
+	services.StopDataSourceHealthChecker()
 	manager.DefaultManager.StopScheduler()
 	manager.DefaultManager.StopAll()
 }
