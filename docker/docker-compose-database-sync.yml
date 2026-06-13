@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  nav-database-sync:
+    build:
+      context: ./nav-database-sync
+      dockerfile: Dockerfile
+    image: nav-database-sync
+    container_name: nav-database-sync
+    hostname: nav-database-sync
+    ports:
+      - "3010:3010"
+    volumes:
+      - ./nav-database-sync/logback:/app/database/logback
+      - ./nav-database-sync/data:/app/database/data
+    restart: always
+    networks:
+      - nav-net
+
+networks:
+  nav-net:
+    driver: bridge
