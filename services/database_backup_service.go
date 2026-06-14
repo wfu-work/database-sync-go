@@ -39,6 +39,10 @@ type StartDatabaseBackupRequest struct {
 	ConnectionParams string   `json:"connectionParams"`
 	RetryTimes       int      `json:"retryTimes"`
 	RetryIntervalMs  int      `json:"retryIntervalMs"`
+	BackupTimeField  string   `json:"backupTimeField"`
+	BackupStartTime  string   `json:"backupStartTime"`
+	BackupEndTime    string   `json:"backupEndTime"`
+	BackupWindow     string   `json:"backupWindow"`
 	Remark           string   `json:"remark"`
 }
 
@@ -47,6 +51,10 @@ type backupRunOptions struct {
 	ConnectionParams string
 	RetryTimes       int
 	RetryInterval    time.Duration
+	TimeField        string
+	StartTime        string
+	EndTime          string
+	Window           string
 }
 
 type backupManifest struct {
@@ -116,6 +124,10 @@ func (s DatabaseBackupService) Start(req StartDatabaseBackupRequest) (*domains.D
 	req.DataSourceGuid = strings.TrimSpace(req.DataSourceGuid)
 	req.Tables = normalizeBackupTables(req.Tables)
 	req.ConnectionParams = strings.TrimSpace(req.ConnectionParams)
+	req.BackupTimeField = strings.TrimSpace(req.BackupTimeField)
+	req.BackupStartTime = strings.TrimSpace(req.BackupStartTime)
+	req.BackupEndTime = strings.TrimSpace(req.BackupEndTime)
+	req.BackupWindow = normalizeBackupWindow(req.BackupWindow)
 	req.Remark = strings.TrimSpace(req.Remark)
 	if req.DataSourceGuid == "" {
 		return nil, errors.New("dataSourceGuid required")
@@ -131,6 +143,9 @@ func (s DatabaseBackupService) Start(req StartDatabaseBackupRequest) (*domains.D
 	}
 	if _, err := parseBackupParams(req.ConnectionParams); err != nil {
 		return nil, err
+	}
+	if req.BackupTimeField != "" && req.BackupStartTime == "" {
+		return nil, errors.New("backupStartTime required when backupTimeField is set")
 	}
 
 	source, err := ServiceGroupApp.DataSourceService.GetEnabled(req.DataSourceGuid)
@@ -155,6 +170,10 @@ func (s DatabaseBackupService) Start(req StartDatabaseBackupRequest) (*domains.D
 		BatchSize:        req.BatchSize,
 		RetryTimes:       req.RetryTimes,
 		RetryIntervalMs:  req.RetryIntervalMs,
+		BackupTimeField:  req.BackupTimeField,
+		BackupStartTime:  req.BackupStartTime,
+		BackupEndTime:    req.BackupEndTime,
+		BackupWindow:     req.BackupWindow,
 		Format:           domains.BackupFormatJSONLZip,
 		Status:           domains.BackupStatusPending,
 		TotalTables:      len(req.Tables),
@@ -173,6 +192,10 @@ func (s DatabaseBackupService) Start(req StartDatabaseBackupRequest) (*domains.D
 		ConnectionParams: req.ConnectionParams,
 		RetryTimes:       req.RetryTimes,
 		RetryInterval:    time.Duration(req.RetryIntervalMs) * time.Millisecond,
+		TimeField:        req.BackupTimeField,
+		StartTime:        req.BackupStartTime,
+		EndTime:          req.BackupEndTime,
+		Window:           req.BackupWindow,
 	})
 	return &row, nil
 }
@@ -216,6 +239,11 @@ func (s DatabaseBackupService) Retry(guid string) (*domains.DatabaseBackup, erro
 		"batch_size":        batchSize,
 		"retry_times":       row.RetryTimes,
 		"retry_interval_ms": retryIntervalMs,
+		"backup_time_field": row.BackupTimeField,
+		"backup_start_time": row.BackupStartTime,
+		"backup_end_time":   row.BackupEndTime,
+		"backup_window":     normalizeBackupWindow(row.BackupWindow),
+		"current_window":    "",
 		"total_tables":      len(tables),
 		"finished_tables":   0,
 		"current_table":     "",
@@ -240,6 +268,10 @@ func (s DatabaseBackupService) Retry(guid string) (*domains.DatabaseBackup, erro
 		ConnectionParams: row.ConnectionParams,
 		RetryTimes:       row.RetryTimes,
 		RetryInterval:    time.Duration(retryIntervalMs) * time.Millisecond,
+		TimeField:        row.BackupTimeField,
+		StartTime:        row.BackupStartTime,
+		EndTime:          row.BackupEndTime,
+		Window:           normalizeBackupWindow(row.BackupWindow),
 	})
 	return s.Get(row.Guid)
 }
@@ -320,6 +352,7 @@ func (s DatabaseBackupService) runBackup(backupGuid string, source domains.DataS
 		"current_total":   0,
 		"current_batch":   0,
 		"current_started": 0,
+		"current_window":  "",
 		"update_time":     start,
 	})
 
@@ -414,6 +447,7 @@ func (s DatabaseBackupService) writeBackup(ctx context.Context, backupGuid strin
 			"current_total":   0,
 			"current_batch":   0,
 			"current_started": domains.NowMilli(),
+			"current_window":  "",
 			"update_time":     domains.NowMilli(),
 		})
 		tableMeta, err := s.writeTableBackup(ctx, backupGuid, zipWriter, conn, table, i, opts)
@@ -474,6 +508,20 @@ func (s DatabaseBackupService) writeTableBackup(ctx context.Context, backupGuid 
 			"update_time":   domains.NowMilli(),
 		})
 	}
+	if isTDengineBackupConn(conn) && strings.TrimSpace(opts.StartTime) != "" {
+		opts.TimeField = resolveBackupTimeField(opts.TimeField, columns)
+		if strings.TrimSpace(opts.TimeField) == "" {
+			return backupTableManifest{}, fmt.Errorf("backupTimeField not found and no timestamp field inferred for tdengine window backup table %s", table)
+		}
+		if scopedTotal, err := countBackupTimeRange(ctx, conn, table, opts); err == nil {
+			estimatedRows = scopedTotal
+			_ = s.updateBackup(backupGuid, map[string]any{
+				"current_total": estimatedRows,
+				"update_time":   domains.NowMilli(),
+			})
+		}
+		return s.writeTDengineTableBackupByWindow(ctx, backupGuid, encoder, conn, table, columns, basePath, estimatedRows, opts)
+	}
 	var rowCount int64
 	offset := 0
 	batchIndex := 0
@@ -522,6 +570,74 @@ func (s DatabaseBackupService) writeTableBackup(ctx context.Context, backupGuid 
 	}, nil
 }
 
+func (s DatabaseBackupService) writeTDengineTableBackupByWindow(ctx context.Context, backupGuid string, encoder *json.Encoder, conn connector.Connector, table string, columns []connector.ColumnInfo, basePath string, estimatedRows int64, opts backupRunOptions) (backupTableManifest, error) {
+	valueRange, err := parseBackupTimeRange(opts.StartTime, opts.EndTime)
+	if err != nil {
+		return backupTableManifest{}, err
+	}
+	step := backupWindowDuration(opts.Window)
+	if step <= 0 {
+		step = 24 * time.Hour
+	}
+
+	var rowCount int64
+	batchIndex := 0
+	err = forEachBackupWindow(ctx, valueRange.Start, valueRange.End, step, func(start time.Time, end time.Time) error {
+		windowLabel := backupWindowLabel(start, end)
+		offset := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			rows, err := queryBackupBatch(ctx, conn, connector.QueryOptions{
+				Table:     table,
+				TimeField: opts.TimeField,
+				TimeStart: formatBackupSQLTime(start),
+				TimeEnd:   formatBackupSQLTime(end),
+				Limit:     opts.BatchSize,
+				Offset:    offset,
+			}, opts)
+			if err != nil {
+				return fmt.Errorf("query table %s window %s failed: %w", table, windowLabel, err)
+			}
+			for _, row := range rows {
+				if err := encoder.Encode(row); err != nil {
+					return err
+				}
+			}
+			rowCount += int64(len(rows))
+			batchIndex++
+			if len(rows) > 0 || batchIndex == 1 {
+				_ = s.updateBackup(backupGuid, map[string]any{
+					"current_rows":   rowCount,
+					"current_total":  estimatedRows,
+					"current_batch":  batchIndex,
+					"current_window": windowLabel,
+					"update_time":    domains.NowMilli(),
+				})
+			}
+			if len(rows) < opts.BatchSize {
+				return nil
+			}
+			offset += len(rows)
+		}
+	})
+	if err != nil {
+		return backupTableManifest{}, err
+	}
+
+	return backupTableManifest{
+		Name:      table,
+		Schema:    basePath + "/schema.json",
+		Data:      basePath + "/data.jsonl",
+		Columns:   columns,
+		RowCount:  rowCount,
+		BackupEnd: domains.NowMilli(),
+	}, nil
+}
+
 func (s DatabaseBackupService) finishBackup(backupGuid string, status string, filePath string, fileName string, fileSize int64, totalTables int, totalRows int64, err error) {
 	now := domains.NowMilli()
 	updates := map[string]any{
@@ -539,6 +655,7 @@ func (s DatabaseBackupService) finishBackup(backupGuid string, status string, fi
 		updates["current_total"] = 0
 		updates["current_batch"] = 0
 		updates["current_started"] = 0
+		updates["current_window"] = ""
 	}
 	if filePath != "" {
 		updates["file_path"] = filePath
@@ -606,6 +723,157 @@ func normalizeBackupTables(tables []string) []string {
 		out = append(out, table)
 	}
 	return out
+}
+
+type backupTimeRange struct {
+	Start time.Time
+	End   time.Time
+}
+
+func parseBackupTimeRange(startValue string, endValue string) (backupTimeRange, error) {
+	startValue = strings.TrimSpace(startValue)
+	endValue = strings.TrimSpace(endValue)
+	if startValue == "" {
+		return backupTimeRange{}, errors.New("backupStartTime required for tdengine window backup")
+	}
+	loc := time.Local
+	start, err := parseBackupTimeBoundary(startValue, false, loc)
+	if err != nil {
+		return backupTimeRange{}, fmt.Errorf("invalid backupStartTime: %w", err)
+	}
+	end := time.Now()
+	if endValue != "" {
+		end, err = parseBackupTimeBoundary(endValue, true, loc)
+		if err != nil {
+			return backupTimeRange{}, fmt.Errorf("invalid backupEndTime: %w", err)
+		}
+	}
+	if !end.After(start) {
+		return backupTimeRange{}, errors.New("backupEndTime must be after backupStartTime")
+	}
+	return backupTimeRange{Start: start, End: end}, nil
+}
+
+func inferBackupTimeField(columns []connector.ColumnInfo) string {
+	for _, column := range columns {
+		if strings.Contains(strings.ToLower(column.DatabaseType), "timestamp") {
+			return column.Name
+		}
+	}
+	if len(columns) > 0 {
+		return columns[0].Name
+	}
+	return ""
+}
+
+func resolveBackupTimeField(preferred string, columns []connector.ColumnInfo) string {
+	preferred = strings.TrimSpace(preferred)
+	if preferred != "" {
+		for _, column := range columns {
+			if strings.EqualFold(column.Name, preferred) {
+				return column.Name
+			}
+		}
+	}
+	return inferBackupTimeField(columns)
+}
+
+func countBackupTimeRange(ctx context.Context, conn connector.Connector, table string, opts backupRunOptions) (int64, error) {
+	valueRange, err := parseBackupTimeRange(opts.StartTime, opts.EndTime)
+	if err != nil {
+		return 0, err
+	}
+	return conn.Count(ctx, connector.QueryOptions{
+		Table:     table,
+		TimeField: opts.TimeField,
+		TimeStart: formatBackupSQLTime(valueRange.Start),
+		TimeEnd:   formatBackupSQLTime(valueRange.End),
+	})
+}
+
+func parseBackupTimeBoundary(value string, endOfDate bool, loc *time.Location) (time.Time, error) {
+	if parsed, err := time.ParseInLocation("2006-01-02", value, loc); err == nil {
+		if endOfDate {
+			return parsed.AddDate(0, 0, 1), nil
+		}
+		return parsed, nil
+	}
+	layouts := []string{
+		"2006-01-02 15:04:05.000",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+		time.RFC3339,
+	}
+	var lastErr error
+	for _, layout := range layouts {
+		parsed, err := time.ParseInLocation(layout, value, loc)
+		if err == nil {
+			return parsed, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("unsupported date format")
+	}
+	return time.Time{}, lastErr
+}
+
+func forEachBackupWindow(ctx context.Context, start time.Time, end time.Time, step time.Duration, fn func(time.Time, time.Time) error) error {
+	for cursor := start; cursor.Before(end); {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		next := cursor.Add(step)
+		if next.After(end) {
+			next = end
+		}
+		if !next.After(cursor) {
+			break
+		}
+		if err := fn(cursor, next); err != nil {
+			return err
+		}
+		cursor = next
+	}
+	return nil
+}
+
+func normalizeBackupWindow(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "minute", "hour", "day":
+		return value
+	default:
+		return "day"
+	}
+}
+
+func backupWindowDuration(value string) time.Duration {
+	switch normalizeBackupWindow(value) {
+	case "minute":
+		return time.Minute
+	case "hour":
+		return time.Hour
+	default:
+		return 24 * time.Hour
+	}
+}
+
+func backupWindowLabel(start time.Time, end time.Time) string {
+	return formatBackupSQLTime(start) + " ~ " + formatBackupSQLTime(end)
+}
+
+func formatBackupSQLTime(value time.Time) string {
+	return value.Format("2006-01-02 15:04:05.000")
+}
+
+func isTDengineBackupConn(conn connector.Connector) bool {
+	_, ok := conn.(*connector.TDengineConnector)
+	return ok
 }
 
 func normalizeBackupRunOptions(opts backupRunOptions) backupRunOptions {

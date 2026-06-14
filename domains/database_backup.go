@@ -22,6 +22,11 @@ type DatabaseBackup struct {
 	BatchSize        int    `json:"batchSize" gorm:"comment:备份批次大小"`
 	RetryTimes       int    `json:"retryTimes" gorm:"comment:批次失败重试次数"`
 	RetryIntervalMs  int    `json:"retryIntervalMs" gorm:"comment:批次失败重试间隔毫秒"`
+	BackupTimeField  string `json:"backupTimeField" gorm:"size:128;comment:TDengine 备份时间字段"`
+	BackupStartTime  string `json:"backupStartTime" gorm:"size:64;comment:TDengine 备份开始时间"`
+	BackupEndTime    string `json:"backupEndTime" gorm:"size:64;comment:TDengine 备份结束时间"`
+	BackupWindow     string `json:"backupWindow" gorm:"size:32;comment:TDengine 备份时间窗口"`
+	CurrentWindow    string `json:"currentWindow" gorm:"size:128;comment:当前备份时间窗口"`
 	Format           string `json:"format" gorm:"size:32;comment:备份格式"`
 	Status           string `json:"status" gorm:"size:32;index;comment:备份状态"`
 	TotalTables      int    `json:"totalTables" gorm:"comment:表数量"`
